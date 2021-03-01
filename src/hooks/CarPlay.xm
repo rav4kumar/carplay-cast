@@ -1,5 +1,5 @@
-#include "../common.h"
 #include "../crash_reporting/reporting.h"
+#include "../common.h"
 
 /*
 Injected into the CarPlay process
@@ -20,26 +20,26 @@ If an app already supports CarPlay, leave it alone
 */
 void addCarplayDeclarationsToAppLibrary(id appLibrary)
 {
-    // Load blacklisted identifiers from filesystem
-    NSArray *blacklistedIdentifiers = nil;
-    if ([[NSFileManager defaultManager] fileExistsAtPath:BLACKLIST_PLIST_PATH])
-    {
-        blacklistedIdentifiers = [NSArray arrayWithContentsOfFile:BLACKLIST_PLIST_PATH];
-    }
+    // Load exluded apps from user's preferences
+    NSArray *userExcludedApps = [[CRPreferences sharedInstance] excludedApplications];
 
     for (id appInfo in objcInvoke(appLibrary, @"allInstalledApplications"))
     {
         if (getIvar(appInfo, @"_carPlayDeclaration") == nil)
         {
-            // Skip system apps
+            NSString *appBundleID = objcInvoke(appInfo, @"bundleIdentifier");
+            // Skip system apps if the identifier contains "apple". The intention is to exclude all System/Stock apps, but jailbroken apps (Kodi) are
+            // considered "System", so looking at the identifier is necessary
             if ([objcInvoke(appInfo, @"bundleType") isEqualToString:@"User"] == NO)
             {
-                continue;
+                if ([appBundleID containsString:@"com.apple."])
+                {
+                    continue;
+                }
             }
 
             // Skip if blacklisted
-            NSString *appBundleID = objcInvoke(appInfo, @"bundleIdentifier");
-            if (blacklistedIdentifiers && [blacklistedIdentifiers containsObject:appBundleID])
+            if (userExcludedApps && [userExcludedApps containsObject:appBundleID])
             {
                 continue;
             }
@@ -115,11 +115,14 @@ Carplay dashboard icon appearance
 /*
 Make the CarPlay dashboard show 5 columns of apps instead of 4
 */
-- (void)setNumberOfPortraitColumns:(int)arg1
+- (int)numberOfPortraitColumns
 {
-    // TODO: changes depending on radio screen size
-    int minColumns = MAX(5, arg1);
-    %orig(minColumns);
+    int columns = %orig;
+    if ([[CRPreferences sharedInstance] fiveColumnIconLayout])
+    {
+        columns = MAX(5, columns);
+    }
+    return columns;
 }
 
 /*
@@ -128,8 +131,10 @@ Make the Carplay dashboard icons a little smaller so 5 fit comfortably
 - (struct SBIconImageInfo)iconImageInfoForGridSizeClass:(unsigned long long)arg1
 {
     struct SBIconImageInfo info = %orig;
-    info.size = CGSizeMake(50, 50);
-
+    if ([[CRPreferences sharedInstance] fiveColumnIconLayout])
+    {
+        info.size = CGSizeMake(50, 50);
+    }
     return info;
 }
 
@@ -179,7 +184,7 @@ When an app is launched via Carplay dashboard
 
         return nil;
     }
-    
+
     return %orig;
 }
 
@@ -212,6 +217,30 @@ Called when an app is installed or uninstalled.
 Used for adding "carplay declaration" to newly installed apps so they appear on the dashboard
 */
 %hook _CARDashboardHomeViewController
+
+- (id)initWithEnvironment:(id)arg1
+{
+    id _self = %orig;
+    // Register for Preference Changed notifications
+    [[objc_getClass("NSDistributedNotificationCenter") defaultCenter] addObserverForName:PREFERENCES_CHANGED_NOTIFICATION object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification * _Nonnull note) {
+        // Reload the preferences from disk
+        [[CRPreferences sharedInstance] reloadPreferences];
+        if ([note.object isEqualToString:kPrefsAppLibraryChanged])
+        {
+            // Apps were added/removed - reload the app library
+            id updatedLibrary = objcInvoke(objc_getClass("CARApplication"), @"_newApplicationLibrary");
+            objcInvoke_1(self, @"setLibrary:", updatedLibrary);
+            objcInvoke(self, @"_handleAppLibraryRefresh");
+        }
+        else if ([note.object isEqualToString:kPrefsIconLayoutChanged])
+        {
+            // 5 column dashboard was changed. Relayout dashboard icons
+            objcInvoke(self, @"resetIconState");
+        }
+    }];
+
+    return _self;
+}
 
 - (void)_handleAppLibraryRefresh
 {
@@ -277,10 +306,12 @@ will launch their normal Carplay mode UI
 
 %ctor
 {
-    if ([[[NSProcessInfo processInfo] processName] isEqualToString:@"CarPlay"])
+    BAIL_IF_UNSUPPORTED_IOS;
+
+    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.CarPlayApp"])
     {
         %init(CARPLAY);
-        // Upload any relevant crashlogs 
+        // Upload any relevant crashlogs
         symbolicateAndUploadCrashlogs();
     }
 }

@@ -65,7 +65,7 @@ When an app icon is tapped on the Carplay dashboard
         {
             objcInvoke(liveCarplayWindow, @"dismiss");
         }
-        
+
         // Launch the requested app
         liveCarplayWindow = [[CRCarPlayWindow alloc] initWithBundleIdentifier:identifier];
         objc_setAssociatedObject(self, &kPropertyKey_liveCarplayWindow, liveCarplayWindow, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -85,12 +85,50 @@ Invoked when SpringBoard finishes launching
     // Setup to receive App Launch notifications from the CarPlay process
     [[objc_getClass("NSDistributedNotificationCenter") defaultCenter] addObserver:self selector:NSSelectorFromString(@"handleCarPlayLaunchNotification:") name:@"com.carplayenable" object:nil];
 
+    // Receive notifications for Carplay connect/disconnect events. When a Carplay screen becomes unavailable while an app is being hosted on it, that app window needs to be closed
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(carplayIsConnectedChanged) name:@"CarPlayIsConnectedDidChange" object:nil];
+
     NSMutableArray *appIdentifiersToIgnoreLockAssertions = [[NSMutableArray alloc] init];
     objc_setAssociatedObject(self, &kPropertyKey_lockAssertionIdentifiers, appIdentifiersToIgnoreLockAssertions, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     %orig;
 
-    // Upload any relevant crashlogs 
+    NSOperationQueue *notificationQueue = [[NSOperationQueue alloc] init];
+    [[objc_getClass("NSDistributedNotificationCenter") defaultCenter] addObserverForName:PREFERENCES_APP_DATA_NOTIFICATION object:kPrefsAppDataRequesting queue:notificationQueue usingBlock:^(NSNotification * _Nonnull note) {
+        // The Preference pane is requesting a list of installed apps + icons. Gather the info
+        id appController = objcInvoke(objc_getClass("SBApplicationController"), @"sharedInstance");
+        NSMutableArray *appList = [[NSMutableArray alloc] init];
+        for (id appInfo in objcInvoke(appController, @"allInstalledApplications"))
+        {
+            NSString *identifier = objcInvoke(appInfo, @"bundleIdentifier");
+            // Skip stock apps
+            if (![objcInvoke(appInfo, @"bundleType") isEqualToString:@"User"] && [identifier containsString:@"com.apple."])
+            {
+                continue;
+            }
+            // Skip native-carplay apps
+            if (getIvar(appInfo, @"_carPlayDeclaration") != nil)
+            {
+                continue;
+            }
+
+            // Grab icon data
+            UIImage *appIconImage = objcInvoke_3(objc_getClass("UIImage"), @"_applicationIconImageForBundleIdentifier:format:scale:", identifier, 0, [UIScreen mainScreen].scale);
+            NSData *iconImageData = UIImagePNGRepresentation(appIconImage);
+
+            NSDictionary *appInfoDict = @{
+                @"name": objcInvoke(appInfo, @"displayName"),
+                @"bundleID": identifier,
+                @"iconImage": iconImageData
+            };
+            [appList addObject:appInfoDict];
+
+        }
+        NSDictionary *replyDict = @{@"appList": appList};
+        [[objc_getClass("NSDistributedNotificationCenter") defaultCenter] postNotification:[NSNotification notificationWithName:PREFERENCES_APP_DATA_NOTIFICATION object:kPrefsAppDataReceiving userInfo:replyDict]];
+    }];
+
+    // Upload any relevant crashlogs
     symbolicateAndUploadCrashlogs();
 }
 
@@ -98,6 +136,23 @@ Invoked when SpringBoard finishes launching
 - (id)liveCarplayWindow
 {
     return objc_getAssociatedObject(self, &kPropertyKey_liveCarplayWindow);
+}
+
+/*
+A Carplay connected/disconnected event
+*/
+%new
+- (void)carplayIsConnectedChanged
+{
+    LOG_LIFECYCLE_EVENT;
+    // If a window is being hosted, and the carplay radio disconnected, close the window
+    id liveCarplayWindow = objcInvoke(self, @"liveCarplayWindow");
+    if (liveCarplayWindow && !getCarplayCADisplay())
+    {
+        dispatch_sync(dispatch_get_main_queue(), ^(void) {
+            objcInvoke(liveCarplayWindow, @"dismiss");
+        });
+    }
 }
 
 %end
@@ -392,7 +447,9 @@ int hook_BKSDisplayServicesSetScreenBlanked(int arg1)
 
 %ctor
 {
-    if ([[[NSProcessInfo processInfo] processName] isEqualToString:@"SpringBoard"])
+    BAIL_IF_UNSUPPORTED_IOS;
+
+    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.springboard"])
     {
         %init(SPRINGBOARD);
         // Hook BKSDisplayServicesSetScreenBlanked() - necessary for allowing animations/video when the screen is off
